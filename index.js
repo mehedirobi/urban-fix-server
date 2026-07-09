@@ -58,139 +58,51 @@ async function run() {
 
     // Create / sync user
     app.post("/users", async (req, res) => {
-      try {
-        const { email, name, photoURL } = req.body;
+  try {
+    const { email, name, photoURL } = req.body;
 
-        if (!email) {
-          return res.status(400).send({ message: "Email is required" });
-        }
+    if (!email) {
+      return res.status(400).send({ message: "Email is required" });
+    }
 
-        const normalized = normalizeEmail(email);
-        const existingUser = await usersCollection.findOne({ email: normalized });
+    const normalizedEmail = email.toLowerCase();
+    const existingUser = await usersCollection.findOne({ email: normalizedEmail });
 
-        if (existingUser) {
-          const updateDoc = {
-            name: name || existingUser.name || "",
-            photoURL: photoURL || existingUser.photoURL || "",
-            updatedAt: new Date(),
-          };
+    if (existingUser) {
+      const updatedFields = {
+        name: name || existingUser.name || "",
+        photoURL: photoURL || existingUser.photoURL || "",
+        updatedAt: new Date(),
+      };
 
-          await usersCollection.updateOne(
-            { email: normalized },
-            { $set: updateDoc }
-          );
+      await usersCollection.updateOne(
+        { email: normalizedEmail },
+        { $set: updatedFields }
+      );
 
-          const updatedUser = await usersCollection.findOne({ email: normalized });
-          return res.send(updatedUser);
-        }
+      const updatedUser = await usersCollection.findOne({ email: normalizedEmail });
+      return res.send(updatedUser);
+    }
 
-        const newUser = {
-          email: normalized,
-          name: name || "",
-          photoURL: photoURL || "",
-          role: "citizen",
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
+    const newUser = {
+      email: normalizedEmail,
+      name: name || "",
+      photoURL: photoURL || "",
+      phone: "",
+      role: "citizen",
+      isBlocked: false,
+      isPremium: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
 
-        await usersCollection.insertOne(newUser);
-        res.send(newUser);
-      } catch (error) {
-        console.error("POST /users error:", error);
-        res.status(500).send({ message: "Failed to save user" });
-      }
-    });
-
-    // Get all users
-    app.get("/users", async (_req, res) => {
-      try {
-        const users = await usersCollection.find().sort({ createdAt: -1 }).toArray();
-        res.send(users);
-      } catch (error) {
-        console.error("GET /users error:", error);
-        res.status(500).send({ message: "Failed to fetch users" });
-      }
-    });
-
-    // Get single user
-    app.get("/users/:email", async (req, res) => {
-      try {
-        const email = normalizeEmail(req.params.email);
-        const user = await usersCollection.findOne({ email });
-
-        if (!user) {
-          return res.status(404).send({ message: "User not found" });
-        }
-
-        res.send(user);
-      } catch (error) {
-        console.error("GET /users/:email error:", error);
-        res.status(500).send({ message: "Failed to fetch user" });
-      }
-    });
-
-    // Update own profile
-    app.put("/users/:email", async (req, res) => {
-      try {
-        const email = normalizeEmail(req.params.email);
-        const { name, photoURL } = req.body;
-
-        const existingUser = await usersCollection.findOne({ email });
-        if (!existingUser) {
-          return res.status(404).send({ message: "User not found" });
-        }
-
-        await usersCollection.updateOne(
-          { email },
-          {
-            $set: {
-              name: name || existingUser.name || "",
-              photoURL: photoURL || existingUser.photoURL || "",
-              updatedAt: new Date(),
-            },
-          }
-        );
-
-        const updatedUser = await usersCollection.findOne({ email });
-        res.send(updatedUser);
-      } catch (error) {
-        console.error("PUT /users/:email error:", error);
-        res.status(500).send({ message: "Failed to update user" });
-      }
-    });
-
-    // Update role (for admin/demo)
-    app.patch("/users/role/:email", async (req, res) => {
-      try {
-        const email = normalizeEmail(req.params.email);
-        const { role } = req.body;
-
-        if (!validRoles.includes(role)) {
-          return res.status(400).send({ message: "Invalid role" });
-        }
-
-        const existingUser = await usersCollection.findOne({ email });
-        if (!existingUser) {
-          return res.status(404).send({ message: "User not found" });
-        }
-
-        await usersCollection.updateOne(
-          { email },
-          {
-            $set: {
-              role,
-              updatedAt: new Date(),
-            },
-          }
-        );
-
-        const updatedUser = await usersCollection.findOne({ email });
-        res.send(updatedUser);
-      } catch (error) {
-        console.error("PATCH /users/role/:email error:", error);
-        res.status(500).send({ message: "Failed to update role" });
-      }
-    });
+    await usersCollection.insertOne(newUser);
+    res.send(newUser);
+  } catch (error) {
+    console.error("Error saving user:", error);
+    res.status(500).send({ message: "Failed to save user" });
+  }
+});
 
     // =========================
     // PAYMENTS
