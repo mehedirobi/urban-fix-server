@@ -7,7 +7,12 @@ const stripe = require("stripe")(process.env.STRIPE_SECRET);
 const app = express();
 const port = process.env.PORT || 3000;
 
-app.use(cors());
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 const {
@@ -32,8 +37,22 @@ const client = new MongoClient(uri, {
   },
 });
 
-const normalizeEmail = (email = "") => email.toLowerCase().trim();
+const normalizeEmail = (email = "") => String(email).toLowerCase().trim();
 const validRoles = ["citizen", "staff", "admin"];
+const allowedStatuses = ["Pending", "In Progress", "Resolved", "Rejected"];
+
+function isValidObjectId(id) {
+  return ObjectId.isValid(id);
+}
+
+function buildTimelineEntry({ status, message, updatedBy }) {
+  return {
+    status,
+    message,
+    updatedBy: normalizeEmail(updatedBy || "system"),
+    date: new Date(),
+  };
+}
 
 async function run() {
   try {
@@ -45,64 +64,234 @@ async function run() {
     const issuesCollection = db.collection("issues");
     const paymentsCollection = db.collection("payments");
 
+    // Indexes
     await usersCollection.createIndex({ email: 1 }, { unique: true });
     await paymentsCollection.createIndex({ sessionId: 1 }, { unique: true });
 
+    // =========================
+    // ROOT / HEALTH
+    // =========================
     app.get("/", (_req, res) => {
       res.send("UrbanFix Backend Running");
     });
 
-    // ========================
+    app.get("/health", async (_req, res) => {
+      try {
+        await db.command({ ping: 1 });
+        res.send({
+          success: true,
+          message: "Server healthy",
+          db: "connected",
+        });
+      } catch (error) {
+        res.status(500).send({
+          success: false,
+          message: "Health check failed",
+          error: error.message,
+        });
+      }
+    });
+
+    // =========================
     // USERS
-    // ========================
+    // =========================
 
     // Create / sync user
     app.post("/users", async (req, res) => {
-  try {
-    const { email, name, photoURL } = req.body;
+      try {
+        const { email, name, photoURL } = req.body;
 
-    if (!email) {
-      return res.status(400).send({ message: "Email is required" });
-    }
+        if (!email) {
+          return res.status(400).send({ message: "Email is required" });
+        }
 
-    const normalizedEmail = email.toLowerCase();
-    const existingUser = await usersCollection.findOne({ email: normalizedEmail });
+        const normalizedEmail = normalizeEmail(email);
 
-    if (existingUser) {
-      const updatedFields = {
-        name: name || existingUser.name || "",
-        photoURL: photoURL || existingUser.photoURL || "",
-        updatedAt: new Date(),
-      };
+        const existingUser = await usersCollection.findOne({
+          email: normalizedEmail,
+        });
 
-      await usersCollection.updateOne(
-        { email: normalizedEmail },
-        { $set: updatedFields }
-      );
+        if (existingUser) {
+          const updatedFields = {
+            name: name || existingUser.name || "",
+            photoURL: photoURL || existingUser.photoURL || "",
+            updatedAt: new Date(),
+          };
 
-      const updatedUser = await usersCollection.findOne({ email: normalizedEmail });
-      return res.send(updatedUser);
-    }
+          await usersCollection.updateOne(
+            { email: normalizedEmail },
+            { $set: updatedFields }
+          );
 
-    const newUser = {
-      email: normalizedEmail,
-      name: name || "",
-      photoURL: photoURL || "",
-      phone: "",
-      role: "citizen",
-      isBlocked: false,
-      isPremium: false,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
+          const updatedUser = await usersCollection.findOne({
+            email: normalizedEmail,
+          });
 
-    await usersCollection.insertOne(newUser);
-    res.send(newUser);
-  } catch (error) {
-    console.error("Error saving user:", error);
-    res.status(500).send({ message: "Failed to save user" });
-  }
-});
+          return res.send(updatedUser);
+        }
+
+        const newUser = {
+          email: normalizedEmail,
+          name: name || "",
+          photoURL: photoURL || "",
+          phone: "",
+          role: "citizen",
+          isBlocked: false,
+          isPremium: false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        await usersCollection.insertOne(newUser);
+        return res.send(newUser);
+      } catch (error) {
+        console.error("POST /users error:", error);
+        res.status(500).send({ message: "Failed to save user" });
+      }
+    });
+
+    // Get all users
+    app.get("/users", async (_req, res) => {
+      try {
+        const users = await usersCollection
+          .find()
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(users);
+      } catch (error) {
+        console.error("GET /users error:", error);
+        res.status(500).send({ message: "Failed to fetch users" });
+      }
+    });
+
+    // IMPORTANT FIX: Get single user by email
+    app.get("/users/:email", async (req, res) => {
+      try {
+        const email = normalizeEmail(req.params.email);
+
+        if (!email) {
+          return res.status(400).send({ message: "Email is required" });
+        }
+
+        const user = await usersCollection.findOne({ email });
+
+        if (!user) {
+          return res.status(404).send({ message: "User not found" });
+        }
+
+        res.send(user);
+      } catch (error) {
+        console.error("GET /users/:email error:", error);
+        res.status(500).send({ message: "Failed to fetch user" });
+      }
+    });
+
+    // Update user role
+    app.patch("/users/:id/role", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { role } = req.body;
+
+        if (!isValidObjectId(id)) {
+          return res.status(400).send({ message: "Invalid user ID" });
+        }
+
+        if (!role || !validRoles.includes(role)) {
+          return res.status(400).send({ message: "Invalid role" });
+        }
+
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              role,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        if (!result.modifiedCount) {
+          return res.status(404).send({ message: "User not found or unchanged" });
+        }
+
+        const updatedUser = await usersCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        res.send(updatedUser);
+      } catch (error) {
+        console.error("PATCH /users/:id/role error:", error);
+        res.status(500).send({ message: "Failed to update user role" });
+      }
+    });
+
+    // Block/unblock user
+    app.patch("/users/:id/block", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { isBlocked } = req.body;
+
+        if (!isValidObjectId(id)) {
+          return res.status(400).send({ message: "Invalid user ID" });
+        }
+
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              isBlocked: Boolean(isBlocked),
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        if (!result.matchedCount) {
+          return res.status(404).send({ message: "User not found" });
+        }
+
+        const updatedUser = await usersCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        res.send(updatedUser);
+      } catch (error) {
+        console.error("PATCH /users/:id/block error:", error);
+        res.status(500).send({ message: "Failed to update block status" });
+      }
+    });
+
+    // Premium update
+    app.patch("/users/:email/premium", async (req, res) => {
+      try {
+        const email = normalizeEmail(req.params.email);
+        const { isPremium = true } = req.body;
+
+        if (!email) {
+          return res.status(400).send({ message: "Email is required" });
+        }
+
+        const result = await usersCollection.updateOne(
+          { email },
+          {
+            $set: {
+              isPremium: Boolean(isPremium),
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        if (!result.matchedCount) {
+          return res.status(404).send({ message: "User not found" });
+        }
+
+        const updatedUser = await usersCollection.findOne({ email });
+        res.send(updatedUser);
+      } catch (error) {
+        console.error("PATCH /users/:email/premium error:", error);
+        res.status(500).send({ message: "Failed to update premium status" });
+      }
+    });
 
     // =========================
     // PAYMENTS
@@ -110,7 +299,11 @@ async function run() {
 
     app.post("/create-checkout-session", async (req, res) => {
       try {
-        const { cost, userEmail, purpose = "UrbanFix Premium Service" } = req.body;
+        const {
+          cost,
+          userEmail,
+          purpose = "UrbanFix Premium Service",
+        } = req.body;
 
         if (!cost || Number(cost) <= 0) {
           return res.status(400).send({ message: "Valid cost is required" });
@@ -154,7 +347,9 @@ async function run() {
         const { sessionId, email } = req.body;
 
         if (!sessionId || !email) {
-          return res.status(400).send({ message: "sessionId and email are required" });
+          return res
+            .status(400)
+            .send({ message: "sessionId and email are required" });
         }
 
         const session = await stripe.checkout.sessions.retrieve(sessionId);
@@ -171,8 +366,10 @@ async function run() {
           });
         }
 
+        const normalizedEmail = normalizeEmail(email);
+
         const paymentDoc = {
-          userEmail: normalizeEmail(email),
+          userEmail: normalizedEmail,
           amount: session.amount_total / 100,
           transactionId: session.payment_intent,
           sessionId,
@@ -183,6 +380,18 @@ async function run() {
         };
 
         await paymentsCollection.insertOne(paymentDoc);
+
+        // Optional: user premium true after successful payment
+        await usersCollection.updateOne(
+          { email: normalizedEmail },
+          {
+            $set: {
+              isPremium: true,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
         res.send(paymentDoc);
       } catch (error) {
         console.error("POST /payments/verify error:", error);
@@ -213,7 +422,11 @@ async function run() {
     // All issues
     app.get("/issues", async (_req, res) => {
       try {
-        const issues = await issuesCollection.find().sort({ createdAt: -1 }).toArray();
+        const issues = await issuesCollection
+          .find()
+          .sort({ createdAt: -1 })
+          .toArray();
+
         res.send(issues);
       } catch (error) {
         console.error("GET /issues error:", error);
@@ -260,11 +473,13 @@ async function run() {
       try {
         const { id } = req.params;
 
-        if (!ObjectId.isValid(id)) {
+        if (!isValidObjectId(id)) {
           return res.status(400).send({ message: "Invalid issue ID" });
         }
 
-        const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        const issue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
 
         if (!issue) {
           return res.status(404).send({ message: "Issue not found" });
@@ -305,19 +520,20 @@ async function run() {
           upvotes: 0,
           upvotedUsers: [],
           timeline: [
-            {
+            buildTimelineEntry({
               status: "Pending",
               message: "Issue reported by citizen",
-              updatedBy: normalizeEmail(p.postedBy.email),
-              date: new Date(),
-            },
+              updatedBy: p.postedBy.email,
+            }),
           ],
           createdAt: new Date(),
           updatedAt: new Date(),
         };
 
         const result = await issuesCollection.insertOne(issueDoc);
-        const createdIssue = await issuesCollection.findOne({ _id: result.insertedId });
+        const createdIssue = await issuesCollection.findOne({
+          _id: result.insertedId,
+        });
 
         res.send(createdIssue);
       } catch (error) {
@@ -330,18 +546,25 @@ async function run() {
     app.put("/issues/:id", async (req, res) => {
       try {
         const { id } = req.params;
-        const { title, description, category, location, image, userEmail } = req.body;
+        const { title, description, category, location, image, userEmail } =
+          req.body;
 
-        if (!ObjectId.isValid(id)) {
+        if (!isValidObjectId(id)) {
           return res.status(400).send({ message: "Invalid issue ID" });
         }
 
-        const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        const issue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
         if (!issue) {
           return res.status(404).send({ message: "Issue not found" });
         }
 
-        if (!userEmail || normalizeEmail(issue.postedBy.email) !== normalizeEmail(userEmail)) {
+        if (
+          !userEmail ||
+          normalizeEmail(issue.postedBy.email) !== normalizeEmail(userEmail)
+        ) {
           return res.status(403).send({ message: "Unauthorized" });
         }
 
@@ -350,7 +573,7 @@ async function run() {
           ...(description !== undefined && { description }),
           ...(category && { category }),
           ...(location !== undefined && { location }),
-          ...(image && { image }),
+          ...(image !== undefined && { image }),
           updatedAt: new Date(),
         };
 
@@ -359,7 +582,10 @@ async function run() {
           { $set: updateDoc }
         );
 
-        const updatedIssue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        const updatedIssue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
         res.send(updatedIssue);
       } catch (error) {
         console.error("PUT /issues/:id error:", error);
@@ -373,16 +599,22 @@ async function run() {
         const { id } = req.params;
         const { userEmail } = req.body;
 
-        if (!ObjectId.isValid(id)) {
+        if (!isValidObjectId(id)) {
           return res.status(400).send({ message: "Invalid issue ID" });
         }
 
-        const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        const issue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
         if (!issue) {
           return res.status(404).send({ message: "Issue not found" });
         }
 
-        if (!userEmail || normalizeEmail(issue.postedBy.email) !== normalizeEmail(userEmail)) {
+        if (
+          !userEmail ||
+          normalizeEmail(issue.postedBy.email) !== normalizeEmail(userEmail)
+        ) {
           return res.status(403).send({ message: "Unauthorized" });
         }
 
@@ -400,7 +632,7 @@ async function run() {
         const { id } = req.params;
         const { userEmail } = req.body;
 
-        if (!ObjectId.isValid(id)) {
+        if (!isValidObjectId(id)) {
           return res.status(400).send({ message: "Invalid issue ID" });
         }
 
@@ -409,14 +641,19 @@ async function run() {
         }
 
         const normalizedUserEmail = normalizeEmail(userEmail);
-        const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+
+        const issue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
 
         if (!issue) {
           return res.status(404).send({ message: "Issue not found" });
         }
 
         if (normalizeEmail(issue.postedBy.email) === normalizedUserEmail) {
-          return res.status(400).send({ message: "Cannot upvote your own issue" });
+          return res
+            .status(400)
+            .send({ message: "Cannot upvote your own issue" });
         }
 
         if (issue.upvotedUsers?.includes(normalizedUserEmail)) {
@@ -432,7 +669,10 @@ async function run() {
           }
         );
 
-        const updatedIssue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        const updatedIssue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
         res.send(updatedIssue);
       } catch (error) {
         console.error("PUT /issues/:id/upvote error:", error);
@@ -446,7 +686,7 @@ async function run() {
         const { id } = req.params;
         const { staffEmail, staffName, adminEmail } = req.body;
 
-        if (!ObjectId.isValid(id)) {
+        if (!isValidObjectId(id)) {
           return res.status(400).send({ message: "Invalid issue ID" });
         }
 
@@ -454,7 +694,10 @@ async function run() {
           return res.status(400).send({ message: "staffEmail is required" });
         }
 
-        const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        const issue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
         if (!issue) {
           return res.status(404).send({ message: "Issue not found" });
         }
@@ -464,12 +707,11 @@ async function run() {
           name: staffName || "",
         };
 
-        const timelineEntry = {
+        const timelineEntry = buildTimelineEntry({
           status: issue.status,
           message: `Issue assigned to ${staffName || staffEmail}`,
-          updatedBy: normalizeEmail(adminEmail || "admin"),
-          date: new Date(),
-        };
+          updatedBy: adminEmail || "admin",
+        });
 
         await issuesCollection.updateOne(
           { _id: new ObjectId(id) },
@@ -484,7 +726,10 @@ async function run() {
           }
         );
 
-        const updatedIssue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        const updatedIssue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
         res.send(updatedIssue);
       } catch (error) {
         console.error("PATCH /issues/:id/assign error:", error);
@@ -498,9 +743,7 @@ async function run() {
         const { id } = req.params;
         const { status, message, updatedBy } = req.body;
 
-        const allowedStatuses = ["Pending", "In Progress", "Resolved", "Rejected"];
-
-        if (!ObjectId.isValid(id)) {
+        if (!isValidObjectId(id)) {
           return res.status(400).send({ message: "Invalid issue ID" });
         }
 
@@ -508,17 +751,19 @@ async function run() {
           return res.status(400).send({ message: "Invalid status" });
         }
 
-        const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        const issue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
         if (!issue) {
           return res.status(404).send({ message: "Issue not found" });
         }
 
-        const timelineEntry = {
+        const timelineEntry = buildTimelineEntry({
           status,
           message: message || `Issue status updated to ${status}`,
-          updatedBy: normalizeEmail(updatedBy || "staff"),
-          date: new Date(),
-        };
+          updatedBy: updatedBy || "staff",
+        });
 
         await issuesCollection.updateOne(
           { _id: new ObjectId(id) },
@@ -533,7 +778,10 @@ async function run() {
           }
         );
 
-        const updatedIssue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        const updatedIssue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
         res.send(updatedIssue);
       } catch (error) {
         console.error("PATCH /issues/:id/status error:", error);
@@ -541,31 +789,49 @@ async function run() {
       }
     });
 
-    // Optional: boost priority after payment
+    // Boost priority after payment / premium
     app.patch("/issues/:id/boost", async (req, res) => {
       try {
         const { id } = req.params;
         const { userEmail } = req.body;
 
-        if (!ObjectId.isValid(id)) {
+        if (!isValidObjectId(id)) {
           return res.status(400).send({ message: "Invalid issue ID" });
         }
 
-        const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        if (!userEmail) {
+          return res.status(400).send({ message: "userEmail is required" });
+        }
+
+        const normalizedUserEmail = normalizeEmail(userEmail);
+
+        const issue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
         if (!issue) {
           return res.status(404).send({ message: "Issue not found" });
         }
 
-        if (!userEmail || normalizeEmail(issue.postedBy.email) !== normalizeEmail(userEmail)) {
+        if (normalizeEmail(issue.postedBy.email) !== normalizedUserEmail) {
           return res.status(403).send({ message: "Unauthorized" });
         }
 
-        const timelineEntry = {
+        const user = await usersCollection.findOne({
+          email: normalizedUserEmail,
+        });
+
+        if (!user?.isPremium) {
+          return res.status(403).send({
+            message: "Only premium users can boost issues",
+          });
+        }
+
+        const timelineEntry = buildTimelineEntry({
           status: issue.status,
           message: "Issue priority boosted by citizen",
-          updatedBy: normalizeEmail(userEmail),
-          date: new Date(),
-        };
+          updatedBy: normalizedUserEmail,
+        });
 
         await issuesCollection.updateOne(
           { _id: new ObjectId(id) },
@@ -580,7 +846,10 @@ async function run() {
           }
         );
 
-        const updatedIssue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+        const updatedIssue = await issuesCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
         res.send(updatedIssue);
       } catch (error) {
         console.error("PATCH /issues/:id/boost error:", error);
@@ -599,3 +868,5 @@ run();
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
 });
+
+module.exports = app;
