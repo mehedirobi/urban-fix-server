@@ -1,7 +1,15 @@
 require("dotenv").config();
 
-const dns = require("dns");
-dns.setServers(["8.8.8.8", "1.1.1.1"]); // force reliable public DNS (fixes SRV lookup ECONNREFUSED on some Windows/router setups)
+// Local Windows/router DNS ঠিক করার জন্য — Vercel-এর sandboxed environment-এ
+// dns.setServers() কল করলে crash করতে পারে (permission error), তাই শুধু লোকালি রান করাচ্ছি
+if (!process.env.VERCEL) {
+  try {
+    const dns = require("dns");
+    dns.setServers(["8.8.8.8", "1.1.1.1"]);
+  } catch (err) {
+    console.warn("⚠️  Could not set custom DNS servers:", err.message);
+  }
+}
 
 const express = require("express");
 const cors = require("cors");
