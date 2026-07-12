@@ -42,10 +42,14 @@ const stripe = STRIPE_SECRET ? require("stripe")(STRIPE_SECRET) : null;
 ========================= */
 
 if (FB_SERVICE_KEY) {
-  const decoded = Buffer.from(FB_SERVICE_KEY, "base64").toString("utf8");
-  admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(decoded)),
-  });
+  try {
+    const decoded = Buffer.from(FB_SERVICE_KEY, "base64").toString("utf8");
+    admin.initializeApp({
+      credential: admin.credential.cert(JSON.parse(decoded)),
+    });
+  } catch (err) {
+    console.error("❌ Failed to initialize Firebase Admin — check FB_SERVICE_KEY:", err.message);
+  }
 } else {
   console.warn(
     "⚠️  FB_SERVICE_KEY not set — auth-protected routes will reject all requests."
@@ -78,14 +82,28 @@ const uri =
   `mongodb+srv://${encodedUser}:${encodedPass}` +
   `@cluster0.yvhjyyn.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-  maxPoolSize: 10,
-});
+let client;
+
+function getClient() {
+  if (!DB_USER || !DB_PASS) {
+    // env var missing — throw INSIDE a request handler (caught by withDB),
+    // not at module load time, so the function doesn't crash entirely
+    throw new Error(
+      "MongoDB credentials missing: DB_USER/DB_PASS not set in environment"
+    );
+  }
+  if (!client) {
+    client = new MongoClient(uri, {
+      serverApi: {
+        version: ServerApiVersion.v1,
+        strict: true,
+        deprecationErrors: true,
+      },
+      maxPoolSize: 10,
+    });
+  }
+  return client;
+}
 
 let db;
 let usersCollection;
@@ -130,9 +148,10 @@ function requireValidObjectId(paramName = "id") {
 async function connectDB() {
   if (connected) return;
 
-  await client.connect();
+  const dbClient = getClient();
+  await dbClient.connect();
 
-  db = client.db("urbanFixDB");
+  db = dbClient.db("urbanFixDB");
 
   usersCollection = db.collection("users");
   issuesCollection = db.collection("issues");
@@ -979,7 +998,7 @@ async function startServer() {
 
         server.close(async () => {
           try {
-            await client.close();
+            await getClient().close();
             console.log("MongoDB Closed");
           } catch (err) {
             console.error(err);
