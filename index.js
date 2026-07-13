@@ -60,16 +60,34 @@ if (FB_SERVICE_KEY) {
    CORS
 ========================= */
 
-const allowedOrigins = [SITE_DOMAIN, "http://localhost:5173"];
+// SITE_DOMAIN থেকে trailing slash সরিয়ে দেওয়া হচ্ছে (accidental URL mismatch এড়াতে)
+const cleanedSiteDomain = SITE_DOMAIN.replace(/\/$/, "");
+
+const allowedOrigins = [
+  cleanedSiteDomain,
+  "http://localhost:5173",
+  "http://localhost:5174", // Vite যদি port shift করে (5173 busy থাকলে)
+];
 
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin: function (origin, callback) {
+      // Postman/server-to-server requests (no origin header) allow করা হচ্ছে
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      console.warn(`⚠️  CORS blocked request from origin: ${origin}`);
+      return callback(new Error("Not allowed by CORS"));
+    },
     credentials: true,
   })
 );
 
-app.use(express.json());
+// ✅ FIX: default 100kb limit অনেক ছোট ছিল, যার কারণে ছবি/বড় payload এ 413 error আসছিল।
+// এটা বাড়িয়ে 10mb করা হলো। ছবি এখনো ভালো practice অনুযায়ী imgbb/cloud storage এ
+// আপলোড করে শুধু URL পাঠানো উচিত (base64 সরাসরি DB তে রাখা এড়িয়ে চলা ভালো)।
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 /* =========================
    MongoDB
@@ -486,8 +504,8 @@ app.post(
         purpose,
         issueId: issueId || "",
       },
-      success_url: `${SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${SITE_DOMAIN}/dashboard/payment-cancel`,
+      success_url: `${cleanedSiteDomain}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${cleanedSiteDomain}/dashboard/payment-cancel`,
     });
 
     res.send({ url: session.url, sessionId: session.id });
@@ -978,6 +996,24 @@ app.get("/", (req, res) => {
 // ========================
 app.use((req, res) => {
   res.status(404).send({ message: "Route not found" });
+});
+
+// ========================
+// GLOBAL ERROR HANDLER
+// ========================
+// এটা catch করবে যদি express.json() নিজেই malformed JSON বা oversized payload এ error দেয়,
+// যাতে raw crash/stack trace এর বদলে clean JSON error response যায়
+app.use((err, req, res, next) => {
+  if (err.type === "entity.too.large") {
+    return res.status(413).send({ message: "Payload too large. Please reduce file/data size." });
+  }
+  if (err.message === "Not allowed by CORS") {
+    return res.status(403).send({ message: "CORS: Origin not allowed" });
+  }
+  console.error("Unhandled error:", err);
+  if (!res.headersSent) {
+    res.status(500).send({ message: "Internal Server Error" });
+  }
 });
 
 // ========================
