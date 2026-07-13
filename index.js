@@ -169,7 +169,7 @@ async function connectDB() {
   const dbClient = getClient();
   await dbClient.connect();
 
-  db = dbClient.db("urbanFixDB");
+  db = dbClient.db("urbanfix");
 
   usersCollection = db.collection("users");
   issuesCollection = db.collection("issues");
