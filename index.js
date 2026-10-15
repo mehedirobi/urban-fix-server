@@ -23,9 +23,8 @@ const {
   MONGODB_URI,
   MONGODB_DB_NAME,
   SITE_DOMAIN,
+  FRONTEND_URL,
 } = process.env;
-
-const DATABASE_NAME = MONGODB_DB_NAME || "urbanfix";
 
 const PREMIUM_PRICE_CENTS = 10000;
 const PREMIUM_PURPOSE = "UrbanFix Premium Service";
@@ -113,31 +112,43 @@ const defaultSiteDomain = process.env.VERCEL
   ? "https://urban-fix-project-01.netlify.app"
   : "http://localhost:5173";
 
+function normalizeOrigin(value) {
+  const trimmed = value.trim().replace(/\/+$/, "");
+
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return trimmed;
+  }
+}
+
 const allowedOrigins = new Set(
   [
-    SITE_DOMAIN || defaultSiteDomain,
+    FRONTEND_URL || defaultSiteDomain,
+    SITE_DOMAIN || "",
+    process.env.CORS_ORIGINS || "",
     "https://urban-fix-project-01.netlify.app",
     "https://urban-fix.netlify.app",
     "http://localhost:5173",
     "http://localhost:5174",
   ]
     .flatMap((value) => value.split(","))
-    .map((value) => value.trim().replace(/\/+$/, ""))
+    .map(normalizeOrigin)
     .filter(Boolean)
 );
 
-app.use(
-  cors({
-    origin(origin, callback) {
-      if (!origin || allowedOrigins.has(origin.replace(/\/+$/, ""))) {
-        return callback(null, true);
-      }
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(normalizeOrigin(origin))) {
+      return callback(null, true);
+    }
 
-      return callback(new Error("Origin not allowed by CORS"));
-    },
-    credentials: true,
-  })
-);
+    return callback(new Error("Origin not allowed by CORS"));
+  },
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true, limit: "2mb" }));
@@ -151,6 +162,19 @@ const mongoURI =
   (DB_USER && DB_PASS
     ? `mongodb+srv://${encodeURIComponent(DB_USER)}:${encodeURIComponent(DB_PASS)}@cluster0.yvhjyyn.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`
     : "");
+
+const uriDatabaseName = (() => {
+  if (!MONGODB_URI) return "";
+
+  try {
+    return decodeURIComponent(new URL(MONGODB_URI).pathname.slice(1));
+  } catch {
+    return "";
+  }
+})();
+
+const DATABASE_NAME =
+  MONGODB_DB_NAME?.trim() || uriDatabaseName || "urbanfix";
 
 let mongoClient;
 let db;
@@ -285,24 +309,74 @@ function requireValidObjectId(paramName = "id") {
 }
 
 function getPagination(req) {
-  const parsedPage = Number.parseInt(req.query.page, 10);
-  const parsedLimit = Number.parseInt(req.query.limit, 10);
+  const parsePositiveInteger = (value, fallback) => {
+    if (
+      typeof value !== "string" ||
+      !/^\d+$/.test(value)
+    ) {
+      return fallback;
+    }
 
-  const page =
-    Number.isInteger(parsedPage) && parsedPage > 0
-      ? parsedPage
-      : 1;
+    const parsed = Number(value);
 
-  const limit =
-    Number.isInteger(parsedLimit) && parsedLimit > 0
-      ? Math.min(parsedLimit, MAX_PAGE_SIZE)
-      : 10;
+    return Number.isSafeInteger(parsed) && parsed > 0
+      ? parsed
+      : fallback;
+  };
+
+  const limit = Math.min(
+    parsePositiveInteger(req.query.limit, 10),
+    MAX_PAGE_SIZE
+  );
+  const requestedPage = parsePositiveInteger(req.query.page, 1);
+  const maxPage = Math.floor(2_147_483_647 / limit) + 1;
+  const page = Math.min(requestedPage, maxPage);
 
   return {
     page,
     limit,
     skip: (page - 1) * limit,
   };
+}
+
+function normalizeIssueStatus(status) {
+  return String(status)
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+const ISSUE_STATUS_ALIASES = {
+  pending: ["Pending", "pending"],
+  "in progress": [
+    "In Progress",
+    "In-Progress",
+    "in progress",
+    "in-progress",
+    "ongoing",
+    "Ongoing",
+  ],
+  resolved: ["Resolved", "resolved"],
+  rejected: ["Rejected", "rejected"],
+};
+
+const CANONICAL_ISSUE_STATUSES = {
+  pending: "Pending",
+  "in progress": "In Progress",
+  resolved: "Resolved",
+  rejected: "Rejected",
+};
+
+function getIssueStatusFilter(status) {
+  const normalizedStatus = normalizeIssueStatus(status);
+  const aliases = ISSUE_STATUS_ALIASES[normalizedStatus];
+
+  return aliases ? { status: { $in: aliases } } : null;
+}
+
+function getCanonicalIssueStatus(status) {
+  return CANONICAL_ISSUE_STATUSES[normalizeIssueStatus(status)];
 }
 
 function escapeRegex(value) {
@@ -406,6 +480,10 @@ function verifyEmailMatch(req, res, next) {
 }
 
 function verifyBodyEmailMatch(req, res, next) {
+  if (req.body?.email === undefined) {
+    return next();
+  }
+
   const bodyEmail = normalizeEmail(req.body?.email);
   const authenticatedEmail = getAuthenticatedEmail(req);
 
@@ -553,13 +631,13 @@ app.get(
         issuesCollection.countDocuments({
           $and: [
             ownIssues,
-            { status: "Pending" },
+            getIssueStatusFilter("Pending"),
           ],
         }),
         issuesCollection.countDocuments({
           $and: [
             ownIssues,
-            { status: "Resolved" },
+            getIssueStatusFilter("Resolved"),
           ],
         }),
         paymentsCollection.countDocuments({
@@ -583,13 +661,15 @@ app.get(
       resolvedIssues,
     ] = await Promise.all([
       issuesCollection.countDocuments({}),
-      issuesCollection.countDocuments({ status: "Pending" }),
-      issuesCollection.countDocuments({
-        status: {
-          $in: ["In Progress", "In-Progress", "ongoing"],
-        },
-      }),
-      issuesCollection.countDocuments({ status: "Resolved" }),
+      issuesCollection.countDocuments(
+        getIssueStatusFilter("Pending")
+      ),
+      issuesCollection.countDocuments(
+        getIssueStatusFilter("In Progress")
+      ),
+      issuesCollection.countDocuments(
+        getIssueStatusFilter("Resolved")
+      ),
     ]);
 
     if (user.role === "staff") {
@@ -748,6 +828,7 @@ app.get(
 app.get(
   "/users/:email",
   verifyFBToken,
+  verifyNotBlocked,
   withDB(async (req, res) => {
     const email = normalizeEmail(req.params.email);
     const requesterEmail = getAuthenticatedEmail(req);
@@ -760,11 +841,7 @@ app.get(
     }
 
     if (email !== requesterEmail) {
-      const requester = await usersCollection.findOne({
-        email: requesterEmail,
-      });
-
-      if (!requester || requester.role !== "admin") {
+      if (req.dbUser.role !== "admin") {
         return res.status(403).json({
           success: false,
           message: "Forbidden.",
@@ -996,7 +1073,7 @@ app.post(
     }
 
     const siteURL = (
-      SITE_DOMAIN || defaultSiteDomain
+      FRONTEND_URL || defaultSiteDomain
     ).replace(/\/+$/, "");
 
     const session = await stripe.checkout.sessions.create({
@@ -1191,18 +1268,26 @@ app.get(
     const { page, limit, skip } = getPagination(req);
     const filter = {};
 
-    if (status && status !== "all") {
-      if (!VALID_STATUSES.includes(String(status))) {
+    if (
+      status &&
+      normalizeIssueStatus(status) !== "all"
+    ) {
+      const statusFilter = getIssueStatusFilter(status);
+
+      if (!statusFilter) {
         return res.status(400).json({
           success: false,
           message: "Invalid status filter.",
         });
       }
 
-      filter.status = String(status);
+      Object.assign(filter, statusFilter);
     }
 
-    if (category && category !== "all") {
+    if (
+      category &&
+      String(category).toLowerCase() !== "all"
+    ) {
       filter.category = String(category);
     }
 
@@ -1220,10 +1305,15 @@ app.get(
       ];
     }
 
+    const issueSort =
+      normalizeIssueStatus(status) === "resolved"
+        ? { updatedAt: -1, createdAt: -1 }
+        : { createdAt: -1 };
+
     const [issues, total] = await Promise.all([
       issuesCollection
         .find(filter)
-        .sort({ createdAt: -1 })
+        .sort(issueSort)
         .skip(skip)
         .limit(limit)
         .toArray(),
@@ -1449,26 +1539,33 @@ app.patch(
         });
       }
 
-      if (!VALID_STATUSES.includes(req.body.status)) {
+      const canonicalStatus = getCanonicalIssueStatus(
+        req.body.status
+      );
+
+      if (
+        !canonicalStatus ||
+        !VALID_STATUSES.includes(canonicalStatus)
+      ) {
         return res.status(400).json({
           success: false,
           message: "Invalid issue status.",
         });
       }
 
-      updates.status = req.body.status;
+      updates.status = canonicalStatus;
 
-      if (req.body.status !== issue.status) {
+      if (canonicalStatus !== issue.status) {
         const message =
           typeof req.body.message === "string" &&
           req.body.message.trim()
             ? req.body.message.trim().slice(0, 1000)
-            : `Issue status updated to ${req.body.status}.`;
+            : `Issue status updated to ${canonicalStatus}.`;
 
         updates.timeline = [
           ...(Array.isArray(issue.timeline) ? issue.timeline : []),
           {
-            status: req.body.status,
+            status: canonicalStatus,
             message,
             timestamp: new Date(),
             updatedBy: email,
