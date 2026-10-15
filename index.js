@@ -1,300 +1,673 @@
 require("dotenv").config();
 
-// Local Windows/router DNS ঠিক করার জন্য — Vercel-এর sandboxed environment-এ
-// dns.setServers() কল করলে crash করতে পারে (permission error), তাই শুধু লোকালি রান করাচ্ছি
-if (!process.env.VERCEL) {
-  try {
-    const dns = require("dns");
-    dns.setServers(["8.8.8.8", "1.1.1.1"]);
-  } catch (err) {
-    console.warn("⚠️  Could not set custom DNS servers:", err.message);
-  }
-}
-
 const express = require("express");
 const cors = require("cors");
-const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const dns = require("dns");
+const {
+  MongoClient,
+  ServerApiVersion,
+  ObjectId,
+} = require("mongodb");
 const admin = require("firebase-admin");
 
 const app = express();
-const port = process.env.PORT || 3000;
 
-/* =========================
-   ENV
-========================= */
+const PORT = Number(process.env.PORT) || 3000;
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 const {
   DB_USER,
   DB_PASS,
   STRIPE_SECRET,
-  SITE_DOMAIN = "http://localhost:5173",
-  FB_SERVICE_KEY, // base64-encoded firebase service account JSON
+  FB_SERVICE_KEY,
+  MONGODB_URI,
+  MONGODB_DB_NAME,
+  SITE_DOMAIN,
 } = process.env;
 
-if (!DB_USER || !DB_PASS) {
-  console.error("❌ Missing MongoDB credentials in .env");
+const DATABASE_NAME = MONGODB_DB_NAME || "urbanfix";
+
+const PREMIUM_PRICE_CENTS = 10000;
+const PREMIUM_PURPOSE = "UrbanFix Premium Service";
+
+const VALID_ROLES = ["citizen", "staff", "admin"];
+
+const VALID_STATUSES = [
+  "Pending",
+  "In Progress",
+  "Resolved",
+  "Rejected",
+];
+
+const MAX_PAGE_SIZE = 100;
+
+/* ========================================
+   DNS CONFIGURATION
+======================================== */
+
+// Optional workaround for local MongoDB SRV DNS resolution.
+// Configure your DNS through the operating system if possible.
+if (!process.env.VERCEL && process.env.CONFIGURE_PUBLIC_DNS === "true") {
+  try {
+    dns.setServers(["1.1.1.1", "8.8.8.8"]);
+  } catch (error) {
+    console.warn("DNS configuration failed:", error.message);
+  }
 }
 
-const stripe = STRIPE_SECRET ? require("stripe")(STRIPE_SECRET) : null;
+/* ========================================
+   FIREBASE ADMIN
+======================================== */
 
-/* =========================
-   Firebase Admin (for auth)
-========================= */
+let firebaseReady = false;
 
 if (FB_SERVICE_KEY) {
   try {
-    const decoded = Buffer.from(FB_SERVICE_KEY, "base64").toString("utf8");
-    admin.initializeApp({
-      credential: admin.credential.cert(JSON.parse(decoded)),
-    });
-  } catch (err) {
-    console.error("❌ Failed to initialize Firebase Admin — check FB_SERVICE_KEY:", err.message);
+    let serviceAccount;
+
+    try {
+      serviceAccount = JSON.parse(
+        Buffer.from(FB_SERVICE_KEY, "base64").toString("utf8")
+      );
+    } catch {
+      serviceAccount = JSON.parse(FB_SERVICE_KEY);
+    }
+
+    if (!admin.apps.length) {
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+    }
+
+    firebaseReady = true;
+    console.log("Firebase Admin initialized");
+  } catch (error) {
+    console.error(
+      "Firebase Admin initialization failed:",
+      error.message
+    );
   }
 } else {
-  console.warn(
-    "⚠️  FB_SERVICE_KEY not set — auth-protected routes will reject all requests."
-  );
+  console.warn("FB_SERVICE_KEY is not configured");
 }
 
-/* =========================
-   CORS
-========================= */
+/* ========================================
+   STRIPE
+======================================== */
 
-// SITE_DOMAIN থেকে trailing slash সরিয়ে দেওয়া হচ্ছে (accidental URL mismatch এড়াতে)
-const cleanedSiteDomain = SITE_DOMAIN.replace(/\/$/, "");
+let stripe = null;
 
-const allowedOrigins = [
-  cleanedSiteDomain,
-  "http://localhost:5173",
-  "http://localhost:5174", // Vite যদি port shift করে (5173 busy থাকলে)
-];
+if (STRIPE_SECRET) {
+  try {
+    stripe = require("stripe")(STRIPE_SECRET);
+  } catch (error) {
+    console.error("Stripe initialization failed:", error.message);
+  }
+}
+
+/* ========================================
+   CORS AND BODY PARSING
+======================================== */
+
+const defaultSiteDomain = process.env.VERCEL
+  ? "https://urban-fix-project-01.netlify.app"
+  : "http://localhost:5173";
+
+const allowedOrigins = new Set(
+  [
+    SITE_DOMAIN || defaultSiteDomain,
+    "https://urban-fix-project-01.netlify.app",
+    "https://urban-fix.netlify.app",
+    "http://localhost:5173",
+    "http://localhost:5174",
+  ]
+    .flatMap((value) => value.split(","))
+    .map((value) => value.trim().replace(/\/+$/, ""))
+    .filter(Boolean)
+);
 
 app.use(
   cors({
-    origin: function (origin, callback) {
-      // Postman/server-to-server requests (no origin header) allow করা হচ্ছে
-      if (!origin || allowedOrigins.includes(origin)) {
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.has(origin.replace(/\/+$/, ""))) {
         return callback(null, true);
       }
-      console.warn(`⚠️  CORS blocked request from origin: ${origin}`);
-      return callback(new Error("Not allowed by CORS"));
+
+      return callback(new Error("Origin not allowed by CORS"));
     },
     credentials: true,
   })
 );
 
-// ✅ FIX: default 100kb limit অনেক ছোট ছিল, যার কারণে ছবি/বড় payload এ 413 error আসছিল।
-// এটা বাড়িয়ে 10mb করা হলো। ছবি এখনো ভালো practice অনুযায়ী imgbb/cloud storage এ
-// আপলোড করে শুধু URL পাঠানো উচিত (base64 সরাসরি DB তে রাখা এড়িয়ে চলা ভালো)।
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
-/* =========================
-   MongoDB
-========================= */
+/* ========================================
+   MONGODB CONNECTION
+======================================== */
 
-const encodedUser = encodeURIComponent(DB_USER || "");
-const encodedPass = encodeURIComponent(DB_PASS || "");
+const mongoURI =
+  MONGODB_URI ||
+  (DB_USER && DB_PASS
+    ? `mongodb+srv://${encodeURIComponent(DB_USER)}:${encodeURIComponent(DB_PASS)}@cluster0.yvhjyyn.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`
+    : "");
 
-const uri =
-  `mongodb+srv://${encodedUser}:${encodedPass}` +
-  `@cluster0.yvhjyyn.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
-
-let client;
+let mongoClient;
+let db;
+let usersCollection;
+let issuesCollection;
+let paymentsCollection;
+let connectionPromise;
 
 function getClient() {
-  if (!DB_USER || !DB_PASS) {
-    // env var missing — throw INSIDE a request handler (caught by withDB),
-    // not at module load time, so the function doesn't crash entirely
+  if (!mongoURI) {
     throw new Error(
-      "MongoDB credentials missing: DB_USER/DB_PASS not set in environment"
+      "MongoDB configuration missing. Set MONGODB_URI or DB_USER and DB_PASS."
     );
   }
-  if (!client) {
-    client = new MongoClient(uri, {
+
+  if (!mongoClient) {
+    mongoClient = new MongoClient(mongoURI, {
       serverApi: {
         version: ServerApiVersion.v1,
         strict: true,
         deprecationErrors: true,
       },
       maxPoolSize: 10,
+      minPoolSize: 0,
+      serverSelectionTimeoutMS: 10000,
+      connectTimeoutMS: 10000,
     });
   }
-  return client;
+
+  return mongoClient;
 }
 
-let db;
-let usersCollection;
-let issuesCollection;
-let paymentsCollection;
-let connected = false;
+async function connectDB() {
+  if (db && usersCollection && issuesCollection && paymentsCollection) {
+    return db;
+  }
 
-/* =========================
-   Helpers
-========================= */
+  if (connectionPromise) {
+    return connectionPromise;
+  }
 
-const normalizeEmail = (email = "") => email.toLowerCase().trim();
+  connectionPromise = (async () => {
+    const client = getClient();
 
-const validRoles = ["citizen", "staff", "admin"];
+    await client.connect();
 
-const allowedStatuses = ["Pending", "In Progress", "Resolved", "Rejected"];
+    const database = client.db(DATABASE_NAME);
 
-function isValidId(id) {
-  return ObjectId.isValid(id);
+    const users = database.collection("users");
+    const issues = database.collection("issues");
+    const payments = database.collection("payments");
+
+    await Promise.all([
+      users.createIndex({ email: 1 }, { unique: true }),
+      users.createIndex({ role: 1 }),
+      users.createIndex({ isBlocked: 1 }),
+
+      issues.createIndex({ userEmail: 1, createdAt: -1 }),
+      issues.createIndex({ "postedBy.email": 1 }),
+      issues.createIndex({ assignedTo: 1 }),
+      issues.createIndex({ status: 1, createdAt: -1 }),
+      issues.createIndex({ category: 1 }),
+
+      payments.createIndex({ sessionId: 1 }, { unique: true }),
+      payments.createIndex({ userEmail: 1, createdAt: -1 }),
+      payments.createIndex({ status: 1 }),
+    ]);
+
+    db = database;
+    usersCollection = users;
+    issuesCollection = issues;
+    paymentsCollection = payments;
+
+    console.log(`MongoDB connected: ${DATABASE_NAME}`);
+
+    return db;
+  })();
+
+  try {
+    return await connectionPromise;
+  } catch (error) {
+    connectionPromise = null;
+    db = null;
+    usersCollection = null;
+    issuesCollection = null;
+    paymentsCollection = null;
+
+    throw error;
+  }
 }
 
-function getPagination(req) {
-  const page = Math.max(parseInt(req.query.page) || 1, 1);
-  const limit = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 100); // cap at 100
-  const skip = (page - 1) * limit;
-  return { page, limit, skip };
+// Compatibility helper for existing routes.
+const getDB = connectDB;
+
+function withDB(handler) {
+  return async (req, res, next) => {
+    try {
+      await connectDB();
+      await handler(req, res, next);
+    } catch (error) {
+      next(error);
+    }
+  };
 }
+
+/* ========================================
+   GENERAL HELPERS
+======================================== */
+
+const normalizeEmail = (email = "") =>
+  typeof email === "string" ? email.trim().toLowerCase() : "";
+
+const isValidEmail = (email) =>
+  typeof email === "string" &&
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+const isValidObjectId = (id) =>
+  typeof id === "string" &&
+  /^[a-f\d]{24}$/i.test(id);
 
 function requireValidObjectId(paramName = "id") {
   return (req, res, next) => {
-    if (!isValidId(req.params[paramName])) {
-      return res.status(400).send({ message: "Invalid ID" });
+    if (!isValidObjectId(req.params[paramName])) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid ID.",
+      });
     }
+
     next();
   };
 }
 
-/* =========================
-   Connect DB
-========================= */
+function getPagination(req) {
+  const parsedPage = Number.parseInt(req.query.page, 10);
+  const parsedLimit = Number.parseInt(req.query.limit, 10);
 
-async function connectDB() {
-  if (connected) return;
+  const page =
+    Number.isInteger(parsedPage) && parsedPage > 0
+      ? parsedPage
+      : 1;
 
-  const dbClient = getClient();
-  await dbClient.connect();
+  const limit =
+    Number.isInteger(parsedLimit) && parsedLimit > 0
+      ? Math.min(parsedLimit, MAX_PAGE_SIZE)
+      : 10;
 
-  db = dbClient.db("urbanfix");
-
-  usersCollection = db.collection("users");
-  issuesCollection = db.collection("issues");
-  paymentsCollection = db.collection("payments");
-
-  await Promise.all([
-    usersCollection.createIndex({ email: 1 }, { unique: true }),
-    paymentsCollection.createIndex({ sessionId: 1 }, { unique: true }),
-    paymentsCollection.createIndex({ userEmail: 1 }),
-    issuesCollection.createIndex({ "postedBy.email": 1 }),
-    issuesCollection.createIndex({ "assignedTo.email": 1 }),
-    issuesCollection.createIndex({ status: 1 }),
-    issuesCollection.createIndex({ category: 1 }),
-    issuesCollection.createIndex({ createdAt: -1 }),
-  ]);
-
-  connected = true;
-  console.log("✅ MongoDB Connected");
-}
-
-/* =========================
-   Wrapper
-========================= */
-
-function withDB(handler) {
-  return async (req, res) => {
-    try {
-      await connectDB();
-      await handler(req, res);
-    } catch (err) {
-      console.error(err);
-      if (!res.headersSent) {
-        res.status(500).send({ message: "Internal Server Error" });
-      }
-    }
+  return {
+    page,
+    limit,
+    skip: (page - 1) * limit,
   };
 }
 
-/* =========================
-   AUTH MIDDLEWARE
-========================= */
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
-// Verifies Firebase ID token sent as: Authorization: Bearer <token>
+function publicUser(user) {
+  if (!user) return null;
+
+  const { ...safeUser } = user;
+
+  // Never return stored private credentials or secrets.
+  delete safeUser.password;
+  delete safeUser.refreshToken;
+  delete safeUser.resetToken;
+
+  return safeUser;
+}
+
+function getAuthenticatedEmail(req) {
+  return normalizeEmail(req.decoded?.email);
+}
+
+function getIssueOwnerEmail(issue) {
+  return normalizeEmail(
+    issue.userEmail || issue.postedBy?.email
+  );
+}
+
+function isIssueStaff(req) {
+  return ["staff", "admin"].includes(req.dbUser?.role);
+}
+
+/* ========================================
+   AUTHENTICATION MIDDLEWARE
+======================================== */
+
 async function verifyFBToken(req, res, next) {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).send({ message: "Unauthorized: No token" });
+  if (!firebaseReady) {
+    return res.status(503).json({
+      success: false,
+      message: "Authentication service is not configured.",
+    });
   }
 
-  const token = authHeader.split(" ")[1];
+  const authHeader = req.headers.authorization || "";
+  const match = authHeader.match(/^Bearer\s+(\S+)$/i);
+
+  if (!match) {
+    return res.status(401).json({
+      success: false,
+      message: "A valid Bearer token is required.",
+    });
+  }
 
   try {
-    const decoded = await admin.auth().verifyIdToken(token);
-    req.decoded = decoded; // decoded.email available
+    const decoded = await admin.auth().verifyIdToken(match[1]);
+
+    if (!decoded.email || decoded.email_verified !== true) {
+      return res.status(401).json({
+        success: false,
+        message: "A verified email is required.",
+      });
+    }
+
+    req.decoded = decoded;
+
+    // Keep the old property available for existing frontend logic
+    // and route handlers that expect req.user.
+    req.user = {
+      uid: decoded.uid,
+      email: normalizeEmail(decoded.email),
+      name: decoded.name || "",
+      photoURL: decoded.picture || "",
+    };
+
     next();
-  } catch (err) {
-    return res.status(401).send({ message: "Unauthorized: Invalid token" });
+  } catch (error) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized: Invalid or expired token.",
+    });
   }
 }
 
-// Ensures the token's email matches the :email route param
 function verifyEmailMatch(req, res, next) {
-  const routeEmail = normalizeEmail(req.params.email || "");
-  const tokenEmail = normalizeEmail(req.decoded?.email || "");
+  const requestedEmail = normalizeEmail(req.params.email);
+  const authenticatedEmail = getAuthenticatedEmail(req);
 
-  if (routeEmail !== tokenEmail) {
-    return res.status(403).send({ message: "Forbidden: Email mismatch" });
+  if (
+    !requestedEmail ||
+    requestedEmail !== authenticatedEmail
+  ) {
+    return res.status(403).json({
+      success: false,
+      message: "Forbidden: Email mismatch.",
+    });
   }
+
   next();
 }
 
-// Role-based guard — checks role in DB (call AFTER verifyFBToken)
+function verifyBodyEmailMatch(req, res, next) {
+  const bodyEmail = normalizeEmail(req.body?.email);
+  const authenticatedEmail = getAuthenticatedEmail(req);
+
+  if (
+    !bodyEmail ||
+    bodyEmail !== authenticatedEmail
+  ) {
+    return res.status(403).json({
+      success: false,
+      message: "Forbidden: Email mismatch.",
+    });
+  }
+
+  next();
+}
+
+async function loadCurrentUser(req, res, next) {
+  try {
+    await connectDB();
+
+    const email = getAuthenticatedEmail(req);
+
+    const user = await usersCollection.findOne({ email });
+
+    if (!user) {
+      return res.status(403).json({
+        success: false,
+        message: "User account not found. Please register first.",
+      });
+    }
+
+    if (user.isBlocked) {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is blocked.",
+      });
+    }
+
+    req.dbUser = user;
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
 function verifyRole(...roles) {
   return async (req, res, next) => {
     try {
       await connectDB();
-      const email = normalizeEmail(req.decoded?.email || "");
+
+      const email = getAuthenticatedEmail(req);
       const user = await usersCollection.findOne({ email });
 
-      if (!user || !roles.includes(user.role)) {
-        return res.status(403).send({ message: "Forbidden: Insufficient role" });
+      if (!user) {
+        return res.status(403).json({
+          success: false,
+          message: "User account not found.",
+        });
       }
+
+      if (user.isBlocked) {
+        return res.status(403).json({
+          success: false,
+          message: "Your account is blocked.",
+        });
+      }
+
+      if (!roles.includes(user.role)) {
+        return res.status(403).json({
+          success: false,
+          message: "Forbidden: Insufficient permissions.",
+        });
+      }
+
       req.dbUser = user;
       next();
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ message: "Internal Server Error" });
+    } catch (error) {
+      next(error);
     }
   };
 }
 
+const verifyToken = verifyFBToken;
 const verifyAdmin = verifyRole("admin");
 const verifyStaffOrAdmin = verifyRole("staff", "admin");
+const verifyNotBlocked = loadCurrentUser;
 
-// ========================
-// USERS
-// ========================
+/* ========================================
+   HEALTH CHECK
+======================================== */
 
-// Create / Sync User (public — called right after login/signup)
-app.post(
-  "/users",
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "UrbanFix API is running.",
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "UrbanFix API is healthy.",
+  });
+});
+
+app.get(
+  "/health/db",
   withDB(async (req, res) => {
-    const { email, name = "", photoURL = "" } = req.body;
+    await db.command({ ping: 1 });
 
-    if (!email) {
-      return res.status(400).send({ message: "Email is required" });
+    res.json({
+      success: true,
+      message: "MongoDB connection is healthy.",
+    });
+  })
+);
+
+/* ========================================
+   DASHBOARD OVERVIEW
+======================================== */
+
+app.get(
+  "/dashboard-overview",
+  verifyFBToken,
+  verifyNotBlocked,
+  withDB(async (req, res) => {
+    const email = getAuthenticatedEmail(req);
+    const user = req.dbUser;
+
+    if (user.role === "citizen") {
+      const ownIssues = {
+        $or: [
+          { userEmail: email },
+          { "postedBy.email": email },
+        ],
+      };
+
+      const [
+        totalIssues,
+        pendingIssues,
+        resolvedIssues,
+        totalPayments,
+      ] = await Promise.all([
+        issuesCollection.countDocuments(ownIssues),
+        issuesCollection.countDocuments({
+          $and: [
+            ownIssues,
+            { status: "Pending" },
+          ],
+        }),
+        issuesCollection.countDocuments({
+          $and: [
+            ownIssues,
+            { status: "Resolved" },
+          ],
+        }),
+        paymentsCollection.countDocuments({
+          userEmail: email,
+          status: "Paid",
+        }),
+      ]);
+
+      return res.json({
+        totalIssues,
+        pendingIssues,
+        resolvedIssues,
+        totalPayments,
+      });
     }
 
-    const normalizedEmail = normalizeEmail(email);
+    const [
+      totalIssues,
+      pendingIssues,
+      inProgressIssues,
+      resolvedIssues,
+    ] = await Promise.all([
+      issuesCollection.countDocuments({}),
+      issuesCollection.countDocuments({ status: "Pending" }),
+      issuesCollection.countDocuments({
+        status: {
+          $in: ["In Progress", "In-Progress", "ongoing"],
+        },
+      }),
+      issuesCollection.countDocuments({ status: "Resolved" }),
+    ]);
 
-    const existingUser = await usersCollection.findOne({ email: normalizedEmail });
+    if (user.role === "staff") {
+      return res.json({
+        totalIssues,
+        pendingIssues,
+        inProgressIssues,
+        resolvedIssues,
+      });
+    }
+
+    const [
+      totalUsers,
+      totalPayments,
+      totalPremiumUsers,
+    ] = await Promise.all([
+      usersCollection.countDocuments({}),
+      paymentsCollection.countDocuments({ status: "Paid" }),
+      usersCollection.countDocuments({ isPremium: true }),
+    ]);
+
+    res.json({
+      totalUsers,
+      totalIssues,
+      totalPayments,
+      totalPremiumUsers,
+      pendingIssues,
+      inProgressIssues,
+      resolvedIssues,
+    });
+  })
+);
+
+/* ========================================
+   USERS
+======================================== */
+
+// Register/synchronize Firebase user.
+// The authenticated token, not the body, determines the email.
+app.post(
+  "/users",
+  verifyFBToken,
+  verifyBodyEmailMatch,
+  withDB(async (req, res) => {
+    const email = getAuthenticatedEmail(req);
+
+    const name =
+      typeof req.body.name === "string"
+        ? req.body.name.trim().slice(0, 100)
+        : "";
+
+    const photoURL =
+      typeof req.body.photoURL === "string"
+        ? req.body.photoURL.trim().slice(0, 2048)
+        : "";
+
+    const existingUser = await usersCollection.findOne({ email });
 
     if (existingUser) {
+      const fields = {
+        updatedAt: new Date(),
+      };
+
+      if (name) fields.name = name;
+      if (photoURL) fields.photoURL = photoURL;
+
       await usersCollection.updateOne(
-        { email: normalizedEmail },
-        { $set: { name, photoURL, updatedAt: new Date() } }
+        { email },
+        { $set: fields }
       );
 
-      const updatedUser = await usersCollection.findOne({ email: normalizedEmail });
-      return res.send(updatedUser);
+      const updatedUser = await usersCollection.findOne({ email });
+
+      return res.json(publicUser(updatedUser));
     }
 
     const newUser = {
-      email: normalizedEmail,
+      email,
       name,
       photoURL,
       phone: "",
@@ -305,12 +678,19 @@ app.post(
       updatedAt: new Date(),
     };
 
-    await usersCollection.insertOne(newUser);
-    res.status(201).send(newUser);
+    try {
+      await usersCollection.insertOne(newUser);
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+    }
+
+    const savedUser = await usersCollection.findOne({ email });
+
+    res.status(201).json(publicUser(savedUser));
   })
 );
 
-// Get Users — admin only
+// Admin: list users.
 app.get(
   "/users",
   verifyFBToken,
@@ -318,740 +698,1094 @@ app.get(
   withDB(async (req, res) => {
     const query = {};
 
-    if (req.query.role && validRoles.includes(req.query.role.toLowerCase())) {
-      query.role = req.query.role.toLowerCase();
+    if (req.query.role) {
+      const role = String(req.query.role).toLowerCase();
+
+      if (!VALID_ROLES.includes(role)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid role filter.",
+        });
+      }
+
+      query.role = role;
     }
 
     if (req.query.email) {
-      query.email = normalizeEmail(req.query.email);
+      query.email = normalizeEmail(String(req.query.email));
     }
 
     const { page, limit, skip } = getPagination(req);
 
     const [users, total] = await Promise.all([
-      usersCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      usersCollection
+        .find(query)
+        .project({
+          password: 0,
+          refreshToken: 0,
+          resetToken: 0,
+        })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray(),
       usersCollection.countDocuments(query),
     ]);
 
-    res.send({
+    res.json({
       data: users,
-      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
     });
   })
 );
 
-// Single User — must be self or admin
+// Read own profile, or another user's profile as admin.
 app.get(
   "/users/:email",
   verifyFBToken,
   withDB(async (req, res) => {
     const email = normalizeEmail(req.params.email);
-    const tokenEmail = normalizeEmail(req.decoded.email);
+    const requesterEmail = getAuthenticatedEmail(req);
 
-    if (email !== tokenEmail) {
-      const requester = await usersCollection.findOne({ email: tokenEmail });
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid email.",
+      });
+    }
+
+    if (email !== requesterEmail) {
+      const requester = await usersCollection.findOne({
+        email: requesterEmail,
+      });
+
       if (!requester || requester.role !== "admin") {
-        return res.status(403).send({ message: "Forbidden" });
+        return res.status(403).json({
+          success: false,
+          message: "Forbidden.",
+        });
       }
     }
 
     const user = await usersCollection.findOne({ email });
 
     if (!user) {
-      return res.status(404).send({ message: "User not found" });
+      return res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
     }
 
-    res.send(user);
+    res.json(publicUser(user));
   })
 );
 
-// Update Profile — self only
+// Update own profile.
 app.patch(
   "/users/:email",
   verifyFBToken,
   verifyEmailMatch,
+  verifyNotBlocked,
   withDB(async (req, res) => {
     const email = normalizeEmail(req.params.email);
     const { name, photoURL, phone } = req.body;
+    const fields = {};
 
-    const updateDoc = { $set: { updatedAt: new Date() } };
+    if (name !== undefined) {
+      if (
+        typeof name !== "string" ||
+        name.trim().length > 100
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid name.",
+        });
+      }
 
-    if (name !== undefined) updateDoc.$set.name = name;
-    if (photoURL !== undefined) updateDoc.$set.photoURL = photoURL;
-    if (phone !== undefined) updateDoc.$set.phone = phone;
+      fields.name = name.trim();
+    }
 
-    const result = await usersCollection.updateOne({ email }, updateDoc);
+    if (photoURL !== undefined) {
+      if (
+        typeof photoURL !== "string" ||
+        photoURL.trim().length > 2048
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid photoURL.",
+        });
+      }
+
+      fields.photoURL = photoURL.trim();
+    }
+
+    if (phone !== undefined) {
+      if (
+        typeof phone !== "string" ||
+        phone.trim().length > 30
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid phone.",
+        });
+      }
+
+      fields.phone = phone.trim();
+    }
+
+    if (Object.keys(fields).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No valid profile fields provided.",
+      });
+    }
+
+    fields.updatedAt = new Date();
+
+    const result = await usersCollection.updateOne(
+      { email },
+      { $set: fields }
+    );
 
     if (!result.matchedCount) {
-      return res.status(404).send({ message: "User not found" });
+      return res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
     }
 
     const updatedUser = await usersCollection.findOne({ email });
-    res.send(updatedUser);
+
+    res.json(publicUser(updatedUser));
   })
 );
 
-// Change Role — admin only
+// Admin: change user role.
 app.patch(
   "/users/:id/role",
   verifyFBToken,
   verifyAdmin,
   requireValidObjectId(),
   withDB(async (req, res) => {
-    const { role } = req.body;
+    const role =
+      typeof req.body.role === "string"
+        ? req.body.role.toLowerCase()
+        : "";
 
-    if (!validRoles.includes(role?.toLowerCase())) {
-      return res.status(400).send({ message: "Invalid role" });
+    if (!VALID_ROLES.includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid role.",
+      });
     }
 
-    const result = await usersCollection.findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
-      { $set: { role: role.toLowerCase(), updatedAt: new Date() } },
-      { returnDocument: "after" }
+    const target = await usersCollection.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+
+    if (!target) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
+    }
+
+    if (
+      target.email === getAuthenticatedEmail(req) &&
+      role !== "admin"
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot remove your own admin role.",
+      });
+    }
+
+    await usersCollection.updateOne(
+      { _id: target._id },
+      { $set: { role, updatedAt: new Date() } }
     );
 
-    if (!result) {
-      return res.status(404).send({ message: "User not found" });
-    }
-
-    res.send(result);
+    res.json(
+      publicUser(
+        await usersCollection.findOne({ _id: target._id })
+      )
+    );
   })
 );
 
-// Block / Unblock — admin only
+// Admin: block/unblock user.
 app.patch(
   "/users/:id/block",
   verifyFBToken,
   verifyAdmin,
   requireValidObjectId(),
   withDB(async (req, res) => {
-    const result = await usersCollection.findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
-      { $set: { isBlocked: Boolean(req.body.isBlocked), updatedAt: new Date() } },
-      { returnDocument: "after" }
-    );
-
-    if (!result) {
-      return res.status(404).send({ message: "User not found" });
+    if (typeof req.body.isBlocked !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        message: "isBlocked must be a boolean.",
+      });
     }
 
-    res.send(result);
+    const target = await usersCollection.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+
+    if (!target) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
+    }
+
+    if (target.email === getAuthenticatedEmail(req)) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot block your own account.",
+      });
+    }
+
+    await usersCollection.updateOne(
+      { _id: target._id },
+      {
+        $set: {
+          isBlocked: req.body.isBlocked,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.json(
+      publicUser(
+        await usersCollection.findOne({ _id: target._id })
+      )
+    );
   })
 );
 
-// Premium — self only (usually triggered right after payment verification)
-app.patch(
-  "/users/:email/premium",
-  verifyFBToken,
-  verifyEmailMatch,
-  withDB(async (req, res) => {
-    const email = normalizeEmail(req.params.email);
+/* ========================================
+   STRIPE PAYMENTS
+======================================== */
 
-    const result = await usersCollection.findOneAndUpdate(
-      { email },
-      { $set: { isPremium: Boolean(req.body.isPremium ?? true), updatedAt: new Date() } },
-      { returnDocument: "after" }
-    );
-
-    if (!result) {
-      return res.status(404).send({ message: "User not found" });
-    }
-
-    res.send(result);
-  })
-);
-
-// ========================
-// PAYMENTS
-// ========================
-
-// Create Checkout Session — must be logged in
+// Create Stripe Checkout Session.
 app.post(
   "/create-checkout-session",
   verifyFBToken,
+  verifyNotBlocked,
   withDB(async (req, res) => {
     if (!stripe) {
-      return res.status(500).send({ message: "Stripe is not configured" });
+      return res.status(503).json({
+        success: false,
+        message: "Stripe is not configured.",
+      });
     }
 
-    const { cost, userEmail, purpose = "UrbanFix Premium Service", issueId } = req.body;
+    const email = getAuthenticatedEmail(req);
+    const user = req.dbUser;
 
-    if (!cost || Number(cost) <= 0) {
-      return res.status(400).send({ message: "Valid cost is required" });
+    if (user.isPremium) {
+      return res.status(400).json({
+        success: false,
+        message: "Your account is already premium.",
+      });
     }
 
-    const normalizedEmail = normalizeEmail(userEmail || req.decoded.email);
-
-    if (normalizedEmail !== normalizeEmail(req.decoded.email)) {
-      return res.status(403).send({ message: "Forbidden" });
-    }
+    const siteURL = (
+      SITE_DOMAIN || defaultSiteDomain
+    ).replace(/\/+$/, "");
 
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
       mode: "payment",
+      payment_method_types: ["card"],
       line_items: [
         {
           quantity: 1,
           price_data: {
             currency: "usd",
-            unit_amount: Math.round(Number(cost) * 100),
-            product_data: { name: purpose },
+            unit_amount: PREMIUM_PRICE_CENTS,
+            product_data: {
+              name: PREMIUM_PURPOSE,
+            },
           },
         },
       ],
       metadata: {
-        userEmail: normalizedEmail,
-        purpose,
-        issueId: issueId || "",
+        userEmail: email,
+        purpose: PREMIUM_PURPOSE,
       },
-      success_url: `${cleanedSiteDomain}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${cleanedSiteDomain}/dashboard/payment-cancel`,
+      success_url:
+        `${siteURL}/dashboard/payment-success` +
+        "?session_id={CHECKOUT_SESSION_ID}",
+      cancel_url: `${siteURL}/dashboard/payment-cancel`,
     });
 
-    res.send({ url: session.url, sessionId: session.id });
+    res.json({
+      url: session.url,
+      sessionId: session.id,
+    });
   })
 );
 
-// Verify Payment — must be logged in as the paying user
+// Verify a Stripe Checkout Session.
+// For production, also use a Stripe webhook for reliable fulfillment.
 app.post(
   "/payments/verify",
   verifyFBToken,
+  verifyNotBlocked,
   withDB(async (req, res) => {
     if (!stripe) {
-      return res.status(500).send({ message: "Stripe is not configured" });
+      return res.status(503).json({
+        success: false,
+        message: "Stripe is not configured.",
+      });
     }
 
-    const { sessionId, email } = req.body;
+    const { sessionId } = req.body;
+    const email = getAuthenticatedEmail(req);
 
-    if (!sessionId || !email) {
-      return res.status(400).send({ message: "sessionId and email are required" });
-    }
-
-    if (normalizeEmail(email) !== normalizeEmail(req.decoded.email)) {
-      return res.status(403).send({ message: "Forbidden" });
+    if (
+      typeof sessionId !== "string" ||
+      !sessionId.startsWith("cs_")
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid sessionId is required.",
+      });
     }
 
     const session = await stripe.checkout.sessions.retrieve(sessionId);
 
-    if (session.payment_status !== "paid") {
-      return res.status(400).send({ message: "Payment not completed" });
+    if (
+      session.mode !== "payment" ||
+      session.payment_status !== "paid"
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment has not been completed.",
+      });
     }
 
-    const existingPayment = await paymentsCollection.findOne({ sessionId });
+    if (normalizeEmail(session.metadata?.userEmail) !== email) {
+      return res.status(403).json({
+        success: false,
+        message: "Checkout session does not belong to this user.",
+      });
+    }
 
-    if (existingPayment) {
-      return res.send({ success: true, message: "Already verified", payment: existingPayment });
+    if (
+      session.metadata?.purpose !== PREMIUM_PURPOSE ||
+      session.amount_total !== PREMIUM_PRICE_CENTS ||
+      session.currency !== "usd"
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid premium payment details.",
+      });
     }
 
     const payment = {
-      sessionId,
-      transactionId: session.payment_intent,
+      sessionId: session.id,
+      transactionId:
+        typeof session.payment_intent === "string"
+          ? session.payment_intent
+          : session.payment_intent?.id || null,
       amount: session.amount_total / 100,
+      currency: session.currency,
       method: "Card",
       status: "Paid",
-      purpose: session.metadata?.purpose || "UrbanFix Premium Service",
-      issueId: session.metadata?.issueId || null,
-      userEmail: normalizeEmail(email),
+      purpose: PREMIUM_PURPOSE,
+      issueId: null,
+      userEmail: email,
       createdAt: new Date(),
     };
 
     try {
-      await paymentsCollection.insertOne(payment);
-    } catch (err) {
-      if (err.code === 11000) {
-        const oldPayment = await paymentsCollection.findOne({ sessionId });
-        return res.send({ success: true, payment: oldPayment });
-      }
-      throw err;
+      await paymentsCollection.updateOne(
+        { sessionId: session.id },
+        {
+          $setOnInsert: payment,
+        },
+        { upsert: true }
+      );
+
+      await usersCollection.updateOne(
+        { email },
+        {
+          $set: {
+            isPremium: true,
+            updatedAt: new Date(),
+          },
+        }
+      );
+    } catch (error) {
+      throw error;
     }
 
-    await usersCollection.updateOne(
-      { email: normalizeEmail(email) },
-      { $set: { isPremium: true, updatedAt: new Date() } }
-    );
+    const savedPayment = await paymentsCollection.findOne({
+      sessionId: session.id,
+    });
 
-    res.status(201).send({ success: true, payment });
+    res.json({
+      success: true,
+      message: "Payment verified successfully.",
+      payment: savedPayment,
+    });
   })
 );
 
-// Payment History — self only
+// Payment history: own account only.
 app.get(
   "/payments/:email",
   verifyFBToken,
   verifyEmailMatch,
+  verifyNotBlocked,
   withDB(async (req, res) => {
     const email = normalizeEmail(req.params.email);
     const { page, limit, skip } = getPagination(req);
+    const query = { userEmail: email };
 
-    const [payments, total] = await Promise.all([
-      paymentsCollection.find({ userEmail: email }).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      paymentsCollection.countDocuments({ userEmail: email }),
+    const [data, total] = await Promise.all([
+      paymentsCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray(),
+      paymentsCollection.countDocuments(query),
     ]);
 
-    res.send({
-      data: payments,
-      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+    res.json({
+      data,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
     });
   })
 );
 
-// ========================
-// ISSUES
-// ========================
+/* ========================================
+   ISSUES
+======================================== */
 
-// Get All Issues — public (citizens browse community issues)
+// GET issues.
+//
+// Public callers can view the public issue list.
+// Query-string role/email values are never treated as authentication.
 app.get(
   "/issues",
   withDB(async (req, res) => {
-    const query = {};
-
-    if (req.query.status && allowedStatuses.includes(req.query.status)) {
-      query.status = req.query.status;
-    }
-
-    if (req.query.category) {
-      query.category = req.query.category;
-    }
+    const {
+      status,
+      category,
+      search,
+    } = req.query;
 
     const { page, limit, skip } = getPagination(req);
+    const filter = {};
 
-    const [issues, total] = await Promise.all([
-      issuesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      issuesCollection.countDocuments(query),
-    ]);
-
-    res.send({
-      data: issues,
-      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
-    });
-  })
-);
-
-// My Issues — self only
-app.get(
-  "/issues/my/:email",
-  verifyFBToken,
-  verifyEmailMatch,
-  withDB(async (req, res) => {
-    const email = normalizeEmail(req.params.email);
-    const { page, limit, skip } = getPagination(req);
-    const query = { "postedBy.email": email };
-
-    const [issues, total] = await Promise.all([
-      issuesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      issuesCollection.countDocuments(query),
-    ]);
-
-    res.send({
-      data: issues,
-      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
-    });
-  })
-);
-
-// Assigned Issues — self (staff) or admin
-app.get(
-  "/issues/assigned/:email",
-  verifyFBToken,
-  withDB(async (req, res) => {
-    const email = normalizeEmail(req.params.email);
-    const tokenEmail = normalizeEmail(req.decoded.email);
-
-    if (email !== tokenEmail) {
-      const requester = await usersCollection.findOne({ email: tokenEmail });
-      if (!requester || requester.role !== "admin") {
-        return res.status(403).send({ message: "Forbidden" });
+    if (status && status !== "all") {
+      if (!VALID_STATUSES.includes(String(status))) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid status filter.",
+        });
       }
+
+      filter.status = String(status);
     }
 
-    const { page, limit, skip } = getPagination(req);
-    const query = { "assignedTo.email": email };
+    if (category && category !== "all") {
+      filter.category = String(category);
+    }
+
+    if (search) {
+      const regex = new RegExp(
+        escapeRegex(String(search).slice(0, 100)),
+        "i"
+      );
+
+      filter.$or = [
+        { title: regex },
+        { description: regex },
+        { location: regex },
+        { category: regex },
+      ];
+    }
 
     const [issues, total] = await Promise.all([
-      issuesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      issuesCollection.countDocuments(query),
+      issuesCollection
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray(),
+      issuesCollection.countDocuments(filter),
     ]);
 
-    res.send({
-      data: issues,
-      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+    res.json({
+      success: true,
+      issues,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
     });
   })
 );
 
-// Single Issue — public
+// GET one issue.
 app.get(
   "/issues/:id",
   requireValidObjectId(),
   withDB(async (req, res) => {
-    const issue = await issuesCollection.findOne({ _id: new ObjectId(req.params.id) });
+    const issue = await issuesCollection.findOne({
+      _id: new ObjectId(req.params.id),
+    });
 
     if (!issue) {
-      return res.status(404).send({ message: "Issue not found" });
+      return res.status(404).json({
+        success: false,
+        message: "Issue not found.",
+      });
     }
 
-    res.send(issue);
+    res.json({
+      success: true,
+      issue,
+    });
   })
 );
 
-// Create Issue — must be logged in; postedBy comes from token, not body
+// CREATE issue.
 app.post(
   "/issues",
   verifyFBToken,
+  verifyNotBlocked,
   withDB(async (req, res) => {
-    const p = req.body;
+    const {
+      title,
+      description,
+      category,
+      location,
+      image,
+      photoURL,
+    } = req.body;
 
-    if (!p.title) {
-      return res.status(400).send({ message: "title is required" });
-    }
-
-    const posterEmail = normalizeEmail(req.decoded.email);
-    const poster = await usersCollection.findOne({ email: posterEmail });
-
-    if (poster?.isBlocked) {
-      return res.status(403).send({ message: "Your account is blocked" });
-    }
-
-    const issue = {
-      title: p.title.trim(),
-      description: p.description?.trim() || "",
-      location: p.location || "",
-      category: p.category || "General",
-      image: p.image || "",
-      priority: p.priority || "Normal",
-      status: "Pending",
-      upvotes: 0,
-      upvotedUsers: [],
-      postedBy: {
-        email: posterEmail,
-        name: poster?.name || p.postedBy?.name || "",
-        photoURL: poster?.photoURL || p.postedBy?.photoURL || "",
-      },
-      assignedTo: null,
-      timeline: [
-        {
-          status: "Pending",
-          message: "Issue reported by citizen",
-          updatedBy: posterEmail,
-          date: new Date(),
-        },
-      ],
-      createdAt: new Date(),
-      updatedAt: new Date(),
+    const fields = {
+      title,
+      description,
+      category,
+      location,
     };
 
-    const result = await issuesCollection.insertOne(issue);
-    const created = await issuesCollection.findOne({ _id: result.insertedId });
+    for (const [field, value] of Object.entries(fields)) {
+      if (
+        typeof value !== "string" ||
+        !value.trim()
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: `${field} is required.`,
+        });
+      }
 
-    res.status(201).send(created);
-  })
-);
-
-// ========================
-// UPDATE ISSUE — owner only (via token, not body)
-// ========================
-app.put(
-  "/issues/:id",
-  verifyFBToken,
-  requireValidObjectId(),
-  withDB(async (req, res) => {
-    const { id } = req.params;
-    const { title, description, category, location, image } = req.body;
-
-    const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
-
-    if (!issue) {
-      return res.status(404).send({ message: "Issue not found" });
-    }
-
-    if (normalizeEmail(issue.postedBy.email) !== normalizeEmail(req.decoded.email)) {
-      return res.status(403).send({ message: "Unauthorized" });
-    }
-
-    const updateData = { updatedAt: new Date() };
-
-    if (title !== undefined) updateData.title = title.trim();
-    if (description !== undefined) updateData.description = description.trim();
-    if (category !== undefined) updateData.category = category;
-    if (location !== undefined) updateData.location = location;
-    if (image !== undefined) updateData.image = image;
-
-    await issuesCollection.updateOne({ _id: new ObjectId(id) }, { $set: updateData });
-
-    const updatedIssue = await issuesCollection.findOne({ _id: new ObjectId(id) });
-    res.send(updatedIssue);
-  })
-);
-
-// ========================
-// DELETE ISSUE — owner or admin only
-// ========================
-app.delete(
-  "/issues/:id",
-  verifyFBToken,
-  requireValidObjectId(),
-  withDB(async (req, res) => {
-    const { id } = req.params;
-
-    const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
-
-    if (!issue) {
-      return res.status(404).send({ message: "Issue not found" });
-    }
-
-    const tokenEmail = normalizeEmail(req.decoded.email);
-    const isOwner = normalizeEmail(issue.postedBy.email) === tokenEmail;
-
-    if (!isOwner) {
-      const requester = await usersCollection.findOne({ email: tokenEmail });
-      if (!requester || requester.role !== "admin") {
-        return res.status(403).send({ message: "Unauthorized" });
+      if (value.trim().length > 5000) {
+        return res.status(400).json({
+          success: false,
+          message: `${field} is too long.`,
+        });
       }
     }
 
-    await issuesCollection.deleteOne({ _id: new ObjectId(id) });
+    const normalizedImage =
+      typeof image === "string"
+        ? image.trim()
+        : typeof photoURL === "string"
+          ? photoURL.trim()
+          : "";
 
-    res.send({ success: true, message: "Issue deleted successfully" });
+    if (normalizedImage.length > 2048) {
+      return res.status(400).json({
+        success: false,
+        message: "Image URL is too long.",
+      });
+    }
+
+    const now = new Date();
+    const email = getAuthenticatedEmail(req);
+
+    const issue = {
+      title: title.trim(),
+      description: description.trim(),
+      category: category.trim(),
+      location: location.trim(),
+      image: normalizedImage,
+
+      // Canonical ownership field.
+      userEmail: email,
+      userName:
+        req.dbUser.name ||
+        req.user.name ||
+        email.split("@")[0],
+
+      status: "Pending",
+      priority: "Normal",
+      upvotes: [],
+      upvoteCount: 0,
+      assignedTo: null,
+
+      // Retain the legacy field for compatibility.
+      postedBy: {
+        email,
+        name:
+          req.dbUser.name ||
+          req.user.name ||
+          email.split("@")[0],
+      },
+
+      timeline: [
+        {
+          status: "Pending",
+          message: "Issue reported successfully.",
+          timestamp: now,
+          updatedBy: email,
+        },
+      ],
+
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const result = await issuesCollection.insertOne(issue);
+
+    res.status(201).json({
+      success: true,
+      message: "Issue reported successfully.",
+      issue: {
+        ...issue,
+        _id: result.insertedId,
+      },
+    });
   })
 );
 
-// ========================
-// UPVOTE ISSUE — logged in users only
-// ========================
-app.put(
-  "/issues/:id/upvote",
+// UPDATE issue details or status.
+app.patch(
+  "/issues/:id",
   verifyFBToken,
+  verifyNotBlocked,
   requireValidObjectId(),
   withDB(async (req, res) => {
-    const { id } = req.params;
-    const email = normalizeEmail(req.decoded.email);
+    const issueId = new ObjectId(req.params.id);
 
-    const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+    const issue = await issuesCollection.findOne({
+      _id: issueId,
+    });
 
     if (!issue) {
-      return res.status(404).send({ message: "Issue not found" });
+      return res.status(404).json({
+        success: false,
+        message: "Issue not found.",
+      });
     }
 
-    if (normalizeEmail(issue.postedBy.email) === email) {
-      return res.status(400).send({ message: "You cannot upvote your own issue" });
+    const email = getAuthenticatedEmail(req);
+    const isOwner = getIssueOwnerEmail(issue) === email;
+    const isStaff = isIssueStaff(req);
+
+    if (!isOwner && !isStaff) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not allowed to update this issue.",
+      });
     }
 
-    const result = await issuesCollection.findOneAndUpdate(
-      { _id: new ObjectId(id), upvotedUsers: { $ne: email } },
-      {
-        $inc: { upvotes: 1 },
-        $push: { upvotedUsers: email },
-        $set: { updatedAt: new Date() },
-      },
-      { returnDocument: "after" }
+    const allowedFields = [
+      "title",
+      "description",
+      "category",
+      "location",
+      "image",
+    ];
+
+    const updates = {};
+
+    for (const field of allowedFields) {
+      if (req.body[field] === undefined) continue;
+
+      if (
+        typeof req.body[field] !== "string" ||
+        !req.body[field].trim()
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: `${field} must be a non-empty string.`,
+        });
+      }
+
+      if (req.body[field].trim().length > 5000) {
+        return res.status(400).json({
+          success: false,
+          message: `${field} is too long.`,
+        });
+      }
+
+      updates[field] = req.body[field].trim();
+    }
+
+    if (req.body.status !== undefined) {
+      if (!isStaff) {
+        return res.status(403).json({
+          success: false,
+          message: "Only staff or admin can update issue status.",
+        });
+      }
+
+      if (!VALID_STATUSES.includes(req.body.status)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid issue status.",
+        });
+      }
+
+      updates.status = req.body.status;
+
+      if (req.body.status !== issue.status) {
+        const message =
+          typeof req.body.message === "string" &&
+          req.body.message.trim()
+            ? req.body.message.trim().slice(0, 1000)
+            : `Issue status updated to ${req.body.status}.`;
+
+        updates.timeline = [
+          ...(Array.isArray(issue.timeline) ? issue.timeline : []),
+          {
+            status: req.body.status,
+            message,
+            timestamp: new Date(),
+            updatedBy: email,
+          },
+        ];
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No valid fields provided for update.",
+      });
+    }
+
+    updates.updatedAt = new Date();
+
+    await issuesCollection.updateOne(
+      { _id: issueId },
+      { $set: updates }
     );
 
-    if (!result) {
-      return res.status(400).send({ message: "Already upvoted" });
-    }
+    const updatedIssue = await issuesCollection.findOne({
+      _id: issueId,
+    });
 
-    res.send(result);
+    res.json({
+      success: true,
+      message: "Issue updated successfully.",
+      issue: updatedIssue,
+    });
   })
 );
 
-// ========================
-// ASSIGN ISSUE — staff or admin only
-// ========================
+// DELETE issue.
+app.delete(
+  "/issues/:id",
+  verifyFBToken,
+  verifyNotBlocked,
+  requireValidObjectId(),
+  withDB(async (req, res) => {
+    const issueId = new ObjectId(req.params.id);
+
+    const issue = await issuesCollection.findOne({
+      _id: issueId,
+    });
+
+    if (!issue) {
+      return res.status(404).json({
+        success: false,
+        message: "Issue not found.",
+      });
+    }
+
+    const email = getAuthenticatedEmail(req);
+    const isOwner = getIssueOwnerEmail(issue) === email;
+    const isAdmin = req.dbUser.role === "admin";
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not allowed to delete this issue.",
+      });
+    }
+
+    await issuesCollection.deleteOne({ _id: issueId });
+
+    res.json({
+      success: true,
+      message: "Issue deleted successfully.",
+    });
+  })
+);
+
+// TOGGLE upvote.
+//
+// An atomic update avoids the read-then-write race in the old
+// implementation. The aggregation pipeline derives the count from
+// the resulting upvotes array.
+app.patch(
+  "/issues/:id/upvote",
+  verifyFBToken,
+  verifyNotBlocked,
+  requireValidObjectId(),
+  withDB(async (req, res) => {
+    const issueId = new ObjectId(req.params.id);
+    const email = getAuthenticatedEmail(req);
+
+    const issue = await issuesCollection.findOne({
+      _id: issueId,
+    });
+
+    if (!issue) {
+      return res.status(404).json({
+        success: false,
+        message: "Issue not found.",
+      });
+    }
+
+    if (getIssueOwnerEmail(issue) === email) {
+      return res.status(403).json({
+        success: false,
+        message: "You cannot upvote your own issue.",
+      });
+    }
+
+    const alreadyUpvoted = (
+      Array.isArray(issue.upvotes) ? issue.upvotes : []
+    ).some((value) => normalizeEmail(value) === email);
+
+    const updatePipeline = alreadyUpvoted
+      ? [
+          {
+            $set: {
+              upvotes: {
+                $filter: {
+                  input: {
+                    $ifNull: ["$upvotes", []],
+                  },
+                  as: "upvoter",
+                  cond: {
+                    $ne: [
+                      { $toLower: "$$upvoter" },
+                      email,
+                    ],
+                  },
+                },
+              },
+              updatedAt: "$$NOW",
+            },
+          },
+          {
+            $set: {
+              upvoteCount: { $size: "$upvotes" },
+            },
+          },
+        ]
+      : [
+          {
+            $set: {
+              upvotes: {
+                $setUnion: [
+                  { $ifNull: ["$upvotes", []] },
+                  [email],
+                ],
+              },
+              updatedAt: "$$NOW",
+            },
+          },
+          {
+            $set: {
+              upvoteCount: { $size: "$upvotes" },
+            },
+          },
+        ];
+
+    await issuesCollection.updateOne(
+      { _id: issueId },
+      updatePipeline
+    );
+
+    const updatedIssue = await issuesCollection.findOne({
+      _id: issueId,
+    });
+
+    res.json({
+      success: true,
+      message: alreadyUpvoted
+        ? "Upvote removed."
+        : "Issue upvoted successfully.",
+      issue: updatedIssue,
+    });
+  })
+);
+
+// ASSIGN issue to an active staff member.
 app.patch(
   "/issues/:id/assign",
   verifyFBToken,
   verifyStaffOrAdmin,
   requireValidObjectId(),
   withDB(async (req, res) => {
-    const { id } = req.params;
-    const { staffEmail, staffName } = req.body;
+    const { staffEmail } = req.body;
 
-    if (!staffEmail) {
-      return res.status(400).send({ message: "staffEmail is required" });
+    if (
+      typeof staffEmail !== "string" ||
+      !isValidEmail(staffEmail.trim())
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid staff email is required.",
+      });
     }
 
-    const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+    const normalizedEmail = normalizeEmail(staffEmail);
+
+    const staffUser = await usersCollection.findOne({
+      email: normalizedEmail,
+      role: "staff",
+      isBlocked: { $ne: true },
+    });
+
+    if (!staffUser) {
+      return res.status(400).json({
+        success: false,
+        message: "The selected user is not an active staff member.",
+      });
+    }
+
+    const issueId = new ObjectId(req.params.id);
+
+    const issue = await issuesCollection.findOne({
+      _id: issueId,
+    });
 
     if (!issue) {
-      return res.status(404).send({ message: "Issue not found" });
+      return res.status(404).json({
+        success: false,
+        message: "Issue not found.",
+      });
     }
 
-    const updatedIssue = await issuesCollection.findOneAndUpdate(
-      { _id: new ObjectId(id) },
+    const email = getAuthenticatedEmail(req);
+    const timeline = [
+      ...(Array.isArray(issue.timeline) ? issue.timeline : []),
+      {
+        status: issue.status || "Pending",
+        message: `Issue assigned to ${normalizedEmail}.`,
+        timestamp: new Date(),
+        updatedBy: email,
+      },
+    ];
+
+    await issuesCollection.updateOne(
+      { _id: issueId },
       {
         $set: {
-          assignedTo: { email: normalizeEmail(staffEmail), name: staffName || "" },
+          assignedTo: normalizedEmail,
+          timeline,
           updatedAt: new Date(),
         },
-        $push: {
-          timeline: {
-            status: issue.status,
-            message: `Assigned to ${staffName || staffEmail}`,
-            updatedBy: normalizeEmail(req.decoded.email),
-            date: new Date(),
-          },
-        },
-      },
-      { returnDocument: "after" }
+      }
     );
 
-    res.send(updatedIssue);
+    const updatedIssue = await issuesCollection.findOne({
+      _id: issueId,
+    });
+
+    res.json({
+      success: true,
+      message: "Issue assigned successfully.",
+      issue: updatedIssue,
+    });
   })
 );
 
-// ========================
-// UPDATE ISSUE STATUS — staff or admin only
-// ========================
-app.patch(
-  "/issues/:id/status",
-  verifyFBToken,
-  verifyStaffOrAdmin,
-  requireValidObjectId(),
-  withDB(async (req, res) => {
-    const { id } = req.params;
-    const { status, message } = req.body;
+/* ========================================
+   404 HANDLER
+======================================== */
 
-    if (!allowedStatuses.includes(status)) {
-      return res.status(400).send({ message: "Invalid status" });
-    }
-
-    const updatedIssue = await issuesCollection.findOneAndUpdate(
-      { _id: new ObjectId(id) },
-      {
-        $set: { status, updatedAt: new Date() },
-        $push: {
-          timeline: {
-            status,
-            message: message || `Issue marked as ${status}`,
-            updatedBy: normalizeEmail(req.decoded.email),
-            date: new Date(),
-          },
-        },
-      },
-      { returnDocument: "after" }
-    );
-
-    if (!updatedIssue) {
-      return res.status(404).send({ message: "Issue not found" });
-    }
-
-    res.send(updatedIssue);
-  })
-);
-
-// ========================
-// BOOST PRIORITY — owner only
-// ========================
-app.patch(
-  "/issues/:id/boost",
-  verifyFBToken,
-  requireValidObjectId(),
-  withDB(async (req, res) => {
-    const { id } = req.params;
-    const email = normalizeEmail(req.decoded.email);
-
-    const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
-
-    if (!issue) {
-      return res.status(404).send({ message: "Issue not found" });
-    }
-
-    if (normalizeEmail(issue.postedBy.email) !== email) {
-      return res.status(403).send({ message: "Unauthorized" });
-    }
-
-    if (issue.priority === "High") {
-      return res.status(400).send({ message: "Issue is already boosted" });
-    }
-
-    const updatedIssue = await issuesCollection.findOneAndUpdate(
-      { _id: new ObjectId(id) },
-      {
-        $set: { priority: "High", updatedAt: new Date() },
-        $push: {
-          timeline: {
-            status: issue.status,
-            message: "Issue priority boosted",
-            updatedBy: email,
-            date: new Date(),
-          },
-        },
-      },
-      { returnDocument: "after" }
-    );
-
-    res.send(updatedIssue);
-  })
-);
-
-// ========================
-// HEALTH CHECK
-// ========================
-app.get("/", (req, res) => {
-  res.send({ status: "ok", message: "UrbanFix API is running" });
-});
-
-// ========================
-// 404 HANDLER
-// ========================
 app.use((req, res) => {
-  res.status(404).send({ message: "Route not found" });
+  res.status(404).json({
+    success: false,
+    message: `Route not found: ${req.method} ${req.originalUrl}`,
+  });
 });
 
-// ========================
-// GLOBAL ERROR HANDLER
-// ========================
-// এটা catch করবে যদি express.json() নিজেই malformed JSON বা oversized payload এ error দেয়,
-// যাতে raw crash/stack trace এর বদলে clean JSON error response যায়
-app.use((err, req, res, next) => {
-  if (err.type === "entity.too.large") {
-    return res.status(413).send({ message: "Payload too large. Please reduce file/data size." });
+/* ========================================
+   GLOBAL ERROR HANDLER
+======================================== */
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) {
+    return next(error);
   }
-  if (err.message === "Not allowed by CORS") {
-    return res.status(403).send({ message: "CORS: Origin not allowed" });
+
+  // Avoid logging request headers, authorization tokens, or secrets.
+  console.error("API error:", error.message);
+
+  if (error.message === "Origin not allowed by CORS") {
+    return res.status(403).json({
+      success: false,
+      message: "This origin is not allowed.",
+    });
   }
-  console.error("Unhandled error:", err);
-  if (!res.headersSent) {
-    res.status(500).send({ message: "Internal Server Error" });
+
+  if (error.code === 11000) {
+    return res.status(409).json({
+      success: false,
+      message: "A record with this value already exists.",
+    });
   }
+
+  const status =
+    Number.isInteger(error.status) &&
+    error.status >= 400 &&
+    error.status < 600
+      ? error.status
+      : 500;
+
+  res.status(status).json({
+    success: false,
+    message:
+      !IS_PRODUCTION && status !== 500
+        ? error.message
+        : "Internal server error.",
+  });
 });
 
-// ========================
-// START SERVER
-// ========================
+/* ========================================
+   SERVER STARTUP / VERCEL EXPORT
+======================================== */
 
-async function startServer() {
-  try {
-    await connectDB();
-
-    if (!process.env.VERCEL) {
-      const server = app.listen(port, () => {
-        console.log(`🚀 Server running on http://localhost:${port}`);
-      });
-
-      const shutdown = async () => {
-        console.log("\nClosing server...");
-
-        server.close(async () => {
-          try {
-            await getClient().close();
-            console.log("MongoDB Closed");
-          } catch (err) {
-            console.error(err);
-          }
-
-          process.exit(0);
-        });
-      };
-
-      process.on("SIGINT", shutdown);
-      process.on("SIGTERM", shutdown);
-    }
-  } catch (err) {
-    console.error("Startup Error:", err);
-  }
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`UrbanFix API running on port ${PORT}`);
+  });
 }
-
-startServer();
 
 module.exports = app;
