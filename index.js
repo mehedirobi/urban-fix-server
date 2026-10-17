@@ -273,6 +273,13 @@ function withDB(handler) {
   return async (req, res, next) => {
     try {
       await connectDB();
+    } catch (error) {
+      error.status = 503;
+      next(error);
+      return;
+    }
+
+    try {
       await handler(req, res, next);
     } catch (error) {
       next(error);
@@ -435,10 +442,10 @@ async function verifyFBToken(req, res, next) {
   try {
     const decoded = await admin.auth().verifyIdToken(match[1]);
 
-    if (!decoded.email || decoded.email_verified !== true) {
+    if (!decoded.email) {
       return res.status(401).json({
         success: false,
-        message: "A verified email is required.",
+        message: "A Firebase account email is required.",
       });
     }
 
@@ -525,6 +532,7 @@ async function loadCurrentUser(req, res, next) {
     req.dbUser = user;
     next();
   } catch (error) {
+    if (!db) error.status = 503;
     next(error);
   }
 }
@@ -561,6 +569,7 @@ function verifyRole(...roles) {
       req.dbUser = user;
       next();
     } catch (error) {
+      if (!db) error.status = 503;
       next(error);
     }
   };
@@ -582,23 +591,54 @@ app.get("/", (req, res) => {
   });
 });
 
-app.get("/health", (req, res) => {
-  res.status(200).json({
+async function pingDatabase() {
+  const database = await connectDB();
+  await database.command({ ping: 1 });
+}
+
+app.get("/health", async (req, res, next) => {
+  try {
+    await pingDatabase();
+  } catch (error) {
+    error.status = 503;
+    return next(error);
+  }
+
+  const services = {
+    database: "connected",
+    authentication: firebaseReady ? "configured" : "unavailable",
+  };
+
+  if (!firebaseReady) {
+    return res.status(503).json({
+      success: false,
+      message: "Service unavailable.",
+      services,
+    });
+  }
+
+  res.json({
     success: true,
     message: "UrbanFix API is healthy.",
+    services,
   });
 });
 
 app.get(
   "/health/db",
-  withDB(async (req, res) => {
-    await db.command({ ping: 1 });
+  async (req, res, next) => {
+    try {
+      await pingDatabase();
+    } catch (error) {
+      error.status = 503;
+      return next(error);
+    }
 
     res.json({
       success: true,
       message: "MongoDB connection is healthy.",
     });
-  })
+  }
 );
 
 /* ========================================
@@ -1869,9 +1909,11 @@ app.use((error, req, res, next) => {
   res.status(status).json({
     success: false,
     message:
-      !IS_PRODUCTION && status !== 500
-        ? error.message
-        : "Internal server error.",
+      status === 503
+        ? "Service unavailable."
+        : !IS_PRODUCTION && status !== 500
+          ? error.message
+          : "Internal server error.",
   });
 });
 

@@ -1,4 +1,7 @@
 node_modules
 .env
+.env.*
+!.env.example
 *.json
+*firebase-adminsdk*.json
 .vercel
